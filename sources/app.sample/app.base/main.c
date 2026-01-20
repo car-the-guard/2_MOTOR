@@ -64,7 +64,7 @@
 #define UART_RX_PIN         GPIO_GPA(29)
 #define HC06_BAUDRATE       (9600)
 #define UART_PORTCFG        0
-
+#define CMD_BUF_SIZE            (64)
 
 /*
 ***************************************************************************************************
@@ -74,11 +74,58 @@
 uint32                                  gALiveMsgOnOff;
 static uint32                           gALiveCount;
 
+volatile int32 g_TargetSpeed = 0;   // -100 ~ 100
+volatile int32 g_TargetAngle = 0;   // -100 ~ 100
+
 /*
 ***************************************************************************************************
 *                                         FUNCTION PROTOTYPES
 ***************************************************************************************************
 */
+
+int32 Simple_Atoi(char *str)
+{
+    int32 res = 0;
+    int32 i = 0;
+    while (str[i] >= '0' && str[i] <= '9')
+    {
+        res = res * 10 + (str[i] - '0');
+        i++;
+    }
+    return res;
+}
+
+void Parse_Command(char *cmd)
+{
+    int32 i = 0;
+    int32 val = 0;
+
+    while (cmd[i] != '\0')
+    {
+        if (cmd[i] == 'F') { // 전진
+            val = Simple_Atoi(&cmd[i + 1]);
+            g_TargetSpeed = val;            
+        }
+        else if (cmd[i] == 'B') { // 후진
+            val = Simple_Atoi(&cmd[i + 1]);
+            g_TargetSpeed = -val;           
+        }
+        else if (cmd[i] == 'R') { // 우회전
+            val = Simple_Atoi(&cmd[i + 1]);
+            g_TargetAngle = val;            
+        }
+        else if (cmd[i] == 'L') { // 좌회전
+            val = Simple_Atoi(&cmd[i + 1]);
+            g_TargetAngle = -val;           
+        }
+        i++;
+    }
+}
+
+void Delay_Loop(volatile uint32 count)
+{
+    while (count--) { __asm("nop"); }
+}
 
 static void Main_StartTask
 (
@@ -100,10 +147,7 @@ static void DisplayOTPInfo
     void
 );
 
-void Delay_Loop(volatile uint32 count)
-{
-    while (count--) { __asm("nop"); }
-}
+
 
 
 
@@ -127,10 +171,13 @@ void Delay_Loop(volatile uint32 count)
 void cmain(void)
 {
     UartParam_t uartParam;
-    uint8 rx_buf[1];
-    sint32 rx_len;
+    
+    // 수신 버퍼
+    static uint8 rx_char;
+    static char cmd_buf[CMD_BUF_SIZE];
+    static uint8 cmd_len = 0;
 
-    // 1. 시스템 초기화
+    // 1. 초기화
     (void)SAL_Init();
     BSP_PreInit();
     BSP_Init(); 
@@ -139,56 +186,68 @@ void cmain(void)
     UART_Close(BLUETOOTH_UART_CH);
 
     uartParam.sCh           = BLUETOOTH_UART_CH;
-    uartParam.sPriority     = 10U;                  
-    uartParam.sBaudrate     = HC06_BAUDRATE;        // 9600
-    uartParam.sMode         = UART_POLLING_MODE;    
-    uartParam.sCtsRts       = UART_CTSRTS_OFF;      
-    uartParam.sPortCfg      = UART_PORTCFG; // UART0 기본값 (bsp.c 참조)
-    uartParam.sWordLength   = WORD_LEN_8;           
-    uartParam.sFIFO         = ENABLE_FIFO;          
-    uartParam.s2StopBit     = TWO_STOP_BIT_OFF;     
-    uartParam.sParity       = PARITY_SPACE; // <-- 에러 수정 (uart_test.c 참고)
-    uartParam.sFnCallback   = NULL;                 
+    uartParam.sPriority     = 10U;
+    uartParam.sBaudrate     = HC06_BAUDRATE;
+    uartParam.sMode         = UART_POLLING_MODE;
+    uartParam.sCtsRts       = UART_CTSRTS_OFF;
+    uartParam.sPortCfg      = 0;
+    uartParam.sWordLength   = WORD_LEN_8;
+    uartParam.sFIFO         = ENABLE_FIFO;
+    uartParam.s2StopBit     = TWO_STOP_BIT_OFF;
+    uartParam.sParity       = 0; // No Parity
+    uartParam.sFnCallback   = NULL;
 
-    // UART 열기
     if (UART_Open(&uartParam) != 0) 
     {
         while(1) { Delay_Loop(100000); }
     }
 
-    mcu_printf("\n[VCP] BT Ready (9600)\n");
+    mcu_printf("\n[VCP] Ready!\n");
 
     // 3. 무한 루프
     while (1)
     {
-        sint32 ch;
-        sint8 err = 0;
-
-        // [변경] 한 글자씩 직접 읽어서 에러 확인
-        ch = UART_GetChar(BLUETOOTH_UART_CH, 0, &err);
-
-        // 데이터 수신 성공 (ch >= 0)
-        if (err == 0 && ch >= 0) 
+        // (A) 한 글자 수신 시도
+        if (UART_Read(BLUETOOTH_UART_CH, &rx_char, 1) > 0)
         {
-            uint8 data = (uint8)ch;
-            
-            // 1. 받은 문자 PC 화면에 16진수와 문자로 동시 출력 (디버깅용)
-            // (mcu_printf가 UART0을 쓰므로 폰 화면에도 뜰 수 있음)
-            mcu_printf("[RX] Hex:0x%02X Char:%c\n", data, data);
+            // (B) 줄바꿈 문자 확인 (명령어 끝)
+            if (rx_char == '\n' || rx_char == '\r')
+            {
+                if (cmd_len > 0) 
+                {
+                    cmd_buf[cmd_len] = '\0'; // 문자열 마무리 (Null Termination)
+                    
+                    // [★추가됨] 완성된 문자열 전체 출력
+                    // 스마트폰 앱 화면에 "[CMD] F100R50" 처럼 뜰 것입니다.
+                    mcu_printf("[CMD] %s\n", cmd_buf); 
+                    
+                    // (C) 해석 및 적용
+                    Parse_Command(cmd_buf);
+                    mcu_printf(" -> S:%d, A:%d\n", g_TargetSpeed, g_TargetAngle);
 
-            // 2. 에코 (폰으로 다시 쏴주기)
-            UART_PutChar(BLUETOOTH_UART_CH, data);
-        }
-        else if (err != 0 && err != -1) // -1은 "데이터 없음"이므로 무시
-        {
-            // 에러 발생 시 로그 출력 (예: 프레임 에러, 오버런 등)
-            mcu_printf("[Err] Code: %d\n", err);
+                    // 버퍼 초기화 (다음 명령을 위해)
+                    cmd_len = 0;
+                }
+            }
+            // (D) 일반 문자일 경우 버퍼에 담기
+            else
+            {
+                if (cmd_len < CMD_BUF_SIZE - 1) 
+                {
+                    cmd_buf[cmd_len++] = (char)rx_char;
+                }
+                else 
+                {
+                    cmd_len = 0; // 버퍼 꽉 차면 비움 (안전장치)
+                }
+            }
         }
 
-        // 루프 속도 조절 (너무 빠르면 디버깅 로그 폭주함)
-        Delay_Loop(50000); 
+        // 루프 지연
+        Delay_Loop(1000);
     }
 }
+
 
 /*
 ***************************************************************************************************
