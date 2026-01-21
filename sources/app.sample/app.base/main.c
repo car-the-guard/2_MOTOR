@@ -62,8 +62,8 @@ static void DisplayOTPInfo(void); // 로그에 보여서 추가함
 
 // right motor - PDM Ch1
 #define MOTOR_R_PWM_CH          (1)             
-#define MOTOR_R_IN1             GPIO_GPB(2)     
-#define MOTOR_R_IN2             GPIO_GPB(3)     
+#define MOTOR_R_IN1             GPIO_GPB(24)     
+#define MOTOR_R_IN2             GPIO_GPB(22)     
 
 // parameter set
 #define PWM_PERIOD_NS           (1000000UL)     
