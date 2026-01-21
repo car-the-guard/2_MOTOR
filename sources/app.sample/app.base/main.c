@@ -63,6 +63,7 @@
 static void Delay_Loop(volatile uint32 count);
 static int32 Simple_Atoi(char *str);
 static float Clamp_Val(float x, float lo, float hi);
+
 static void Motor_HW_Init(void);
 static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale);
 static void Motor_Set_VCP(uint32 channel, uint32 p1, uint32 p2, float speed);
@@ -78,6 +79,14 @@ static void DisplayOTPInfo(void); // 로그에 보여서 추가함
 #define BLUETOOTH_UART_CH       (0)             // UART Ch0 (보드 핀맵 확인!)
 #define HC06_BAUDRATE           (9600)        
 #define CMD_BUF_SIZE            (64)  
+
+// [공식 예제 매크로 참고]
+// #define PMM_ON                  (1UL) 
+// #define PMM_OFF                 (0UL)
+
+#define USE_PMM_MONITOR         (0UL) // PMM_OFF
+// Port Number는 보통 0이 CH0(Port A 등)에 해당합니다. 
+#define GPIO_PERICH_CH0         (0UL)
 
 // left motor - PDM Ch0
 #define MOTOR_L_PWM_CH          (0)             
@@ -105,6 +114,8 @@ static uint32                           gALiveCount;
 volatile int32 g_TargetF = 0;   // Forward : -100 ~ 100
 volatile int32 g_TargetR = 0;   // Rotation: -100 ~ 100
 
+static uint32 g_LastDutyL = 0xFFFF; // 초기값은 불가능한 값으로 설정
+static uint32 g_LastDutyR = 0xFFFF;
 /*
 ***************************************************************************************************
 *                                         FUNCTION PROTOTYPES
@@ -147,36 +158,60 @@ void Motor_HW_Init(void)
     PDM_Init(); 
 
     // 초기 상태: 0속도 설정 및 Enable
+    g_LastDutyL = 0xFFFF; 
+    g_LastDutyR = 0xFFFF;
     Update_PWM_Duty(MOTOR_L_PWM_CH, 0);
     Update_PWM_Duty(MOTOR_R_PWM_CH, 0);
 
     // [FIX] PDM Enable (채널, 모니터링OFF)
-    PDM_Enable(MOTOR_L_PWM_CH, 0);
-    PDM_Enable(MOTOR_R_PWM_CH, 0);
+    // PDM_Enable(MOTOR_L_PWM_CH, 0);
+    // PDM_Enable(MOTOR_R_PWM_CH, 0);
 }
 
 static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale)
 {
     PDMModeConfig_t pdmConfig;
-    
-    // 구조체 0으로 초기화 (안전)
+    uint32 *lastDutyPtr = (channel == MOTOR_L_PWM_CH) ? &g_LastDutyL : &g_LastDutyR;
+
+    // [최적화] 값이 바뀌지 않았다면 굳이 껐다 켜지 않음 (모터 떨림 방지)
+    if (*lastDutyPtr == duty_1000_scale) return;
+    *lastDutyPtr = duty_1000_scale;
+
+    if (duty_1000_scale > 0) {
+        mcu_printf("[PWM] Ch:%d Duty:%d (Update)\n", channel, duty_1000_scale);
+    }
+
+    // 1. 설정값 준비
     memset(&pdmConfig, 0, sizeof(PDMModeConfig_t));
 
-    // 1. 기본 설정
-    pdmConfig.mcOperationMode   = PDM_OUTPUT_MODE_PHASE_1; // Phase Mode 1 (기본 PWM)
-    pdmConfig.mcOutputCtrl      = 1; // Output Enable (추정치, 보통 1)
-    pdmConfig.mcClockDivide     = 0; // Divider 0
-
-    // 2. 주기 및 듀티 설정 (나노초 단위)
-    pdmConfig.mcPeriodNanoSec1  = PWM_PERIOD_NS; // 1,000,000ns (1kHz)
+    pdmConfig.mcPortNumber      = GPIO_PERICH_CH0; // 예제 코드의 설정값 (보통 0)
+    pdmConfig.mcOperationMode   = PDM_OUTPUT_MODE_PHASE_1; 
+    pdmConfig.mcOutputCtrl      = 1; 
+    pdmConfig.mcClockDivide     = 0; 
+    pdmConfig.mcPeriodNanoSec1  = PWM_PERIOD_NS; 
     
-    // Duty 계산: (입력값 / 1000) * 주기
-    // 예: 입력 500 -> 500,000ns (50%)
     if(duty_1000_scale > MAX_DUTY_SCALE) duty_1000_scale = MAX_DUTY_SCALE;
     pdmConfig.mcDutyNanoSec1    = duty_1000_scale * (PWM_PERIOD_NS / MAX_DUTY_SCALE);
 
-    // 3. 설정 적용
+    // 2. [핵심] 채널 끄기 (예제: PDM_Disable)
+    // 켜진 상태에서는 설정 변경이 안 먹힐 수 있음
+    //PDM_Disable(channel, PMM_ON);
+    PDM_Disable(channel, USE_PMM_MONITOR);
+
+    // (선택) 예제처럼 끄는 것 기다리기 (안전장치)
+    /* uint32 wait_cnt = 0;
+    while(PDM_GetChannelStatus(channel) && wait_cnt < 1000) { wait_cnt++; }
+    */
+
+    // 3. 설정 적용 (예제: PDM_SetConfig)
     PDM_SetConfig(channel, &pdmConfig);
+
+    // 4. 다시 켜기 (예제: PDM_Enable)
+    // Duty가 0이면 굳이 켤 필요 없음 (노이즈 방지)
+    if (duty_1000_scale > 0)
+    {
+        PDM_Enable(channel, USE_PMM_MONITOR);
+    }
 }
     // 4-2 Motor Control Function
 void Motor_Set_VCP(uint32 channel, uint32 p1, uint32 p2, float speed)
@@ -309,7 +344,8 @@ void cmain(void)
     uartParam.sFnCallback   = NULL;
     UART_Open(&uartParam);
 
-    mcu_printf("\n[VCP] RC Car Ready! (Scale: 0~1000)\n");
+    mcu_printf("\n[2VCP3] RC Car Ready! (Scale: 0~1000)\n");
+
 
     while (1)
     {
