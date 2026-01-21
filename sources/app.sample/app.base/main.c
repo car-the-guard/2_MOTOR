@@ -172,19 +172,20 @@ static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale)
 {
     PDMModeConfig_t pdmConfig;
     uint32 *lastDutyPtr = (channel == MOTOR_L_PWM_CH) ? &g_LastDutyL : &g_LastDutyR;
+    uint32 wait_cnt = 0; // [추가] 타임아웃 카운터
 
-    // [최적화] 값이 바뀌지 않았다면 굳이 껐다 켜지 않음 (모터 떨림 방지)
+    // [최적화] 값이 바뀌지 않았다면 아무것도 안 함 (매우 중요)
     if (*lastDutyPtr == duty_1000_scale) return;
     *lastDutyPtr = duty_1000_scale;
 
+    // [디버그] 로그 출력
     if (duty_1000_scale > 0) {
         mcu_printf("[PWM] Ch:%d Duty:%d (Update)\n", channel, duty_1000_scale);
     }
 
-    // 1. 설정값 준비
+    // 설정값 준비
     memset(&pdmConfig, 0, sizeof(PDMModeConfig_t));
-
-    pdmConfig.mcPortNumber      = GPIO_PERICH_CH0; // 예제 코드의 설정값 (보통 0)
+    pdmConfig.mcPortNumber      = GPIO_PERICH_CH0; 
     pdmConfig.mcOperationMode   = PDM_OUTPUT_MODE_PHASE_1; 
     pdmConfig.mcOutputCtrl      = 1; 
     pdmConfig.mcClockDivide     = 0; 
@@ -193,21 +194,24 @@ static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale)
     if(duty_1000_scale > MAX_DUTY_SCALE) duty_1000_scale = MAX_DUTY_SCALE;
     pdmConfig.mcDutyNanoSec1    = duty_1000_scale * (PWM_PERIOD_NS / MAX_DUTY_SCALE);
 
-    // 2. [핵심] 채널 끄기 (예제: PDM_Disable)
-    // 켜진 상태에서는 설정 변경이 안 먹힐 수 있음
-    //PDM_Disable(channel, PMM_ON);
+    // 1. 채널 끄기
     PDM_Disable(channel, USE_PMM_MONITOR);
 
-    // (선택) 예제처럼 끄는 것 기다리기 (안전장치)
-    /* uint32 wait_cnt = 0;
-    while(PDM_GetChannelStatus(channel) && wait_cnt < 1000) { wait_cnt++; }
-    */
+    // [★핵심 해결책] 하드웨어가 실제로 꺼질 때까지 기다림
+    // 이 부분이 없어서 설정이 무시되었던 것임
+    wait_cnt = 0;
+    while(PDM_GetChannelStatus(channel) == PDM_STATE_BUSY) 
+    { 
+        wait_cnt++;
+        if(wait_cnt > 10000) break; // 무한루프 방지 (안전장치)
+        // 아주 짧은 지연
+        __asm("nop"); 
+    }
 
-    // 3. 설정 적용 (예제: PDM_SetConfig)
+    // 2. 설정 적용 (이제 안전하게 적용됨)
     PDM_SetConfig(channel, &pdmConfig);
 
-    // 4. 다시 켜기 (예제: PDM_Enable)
-    // Duty가 0이면 굳이 켤 필요 없음 (노이즈 방지)
+    // 3. 다시 켜기
     if (duty_1000_scale > 0)
     {
         PDM_Enable(channel, USE_PMM_MONITOR);
