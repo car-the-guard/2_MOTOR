@@ -76,7 +76,8 @@ static void DisplayOTPInfo(void); // 로그에 보여서 추가함
 
 //bluetooth set ch0_A28(18),29(19)
 #define BLUETOOTH_UART_CH       (0)             // UART Ch0 (보드 핀맵 확인!)
-#define HC06_BAUDRATE           (9600)          
+#define HC06_BAUDRATE           (9600)        
+#define CMD_BUF_SIZE            (64)  
 
 // left motor - PDM Ch0
 #define MOTOR_L_PWM_CH          (0)             
@@ -296,8 +297,10 @@ void cmain(void)
     // UART 초기화
     UART_Close(BLUETOOTH_UART_CH);
     uartParam.sCh           = BLUETOOTH_UART_CH;
+    uartParam.sPriority     = 10U;
     uartParam.sBaudrate     = HC06_BAUDRATE;
     uartParam.sMode         = UART_POLLING_MODE;
+    uartParam.sCtsRts       = UART_CTSRTS_OFF;
     uartParam.sPortCfg      = 0; 
     uartParam.sWordLength   = WORD_LEN_8;
     uartParam.sFIFO         = ENABLE_FIFO;
