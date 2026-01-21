@@ -21,44 +21,11 @@
 #include <app_cfg.h>
 #include <debug.h>
 #include <bsp.h>
-//#include "reg_phys.h"
+
 #include <uart.h>
 #include <gpio.h>
 #include <pdm.h>
 #include <string.h>
-//#include <cstdint>
-
-#if (APLT_LINUX_SUPPORT_SPI_DEMO == 1)
-    #include <spi_eccp.h>
-#endif
-#if (APLT_LINUX_SUPPORT_POWER_CTRL == 1)
-    #include <power_app.h>
-#endif
-#if ( MCU_BSP_SUPPORT_APP_KEY == 1)
-    #include <key.h>
-#endif  // ( MCU_BSP_SUPPORT_APP_KEY == 1 )
-
-#if ( MCU_BSP_SUPPORT_APP_CONSOLE == 1 )
-    #include <console.h>
-#endif  // ( MCU_BSP_SUPPORT_APP_CONSOLE == 1 )
-
-#if ( MCU_BSP_SUPPORT_CAN_DEMO == 1 )
-    #include <can_demo.h>
-#endif  // ( MCU_BSP_SUPPORT_CAN_DEMO == 1 )
-
-#if ( MCU_BSP_SUPPORT_APP_IDLE == 1 )
-    #include <idle.h>
-#endif  // ( MCU_BSP_SUPPORT_APP_IDLE == 1 )
-
-#if ( MCU_BSP_SUPPORT_APP_SPI_LED == 1 )
-    #include <spi_led.h>
-#endif  // ( MCU_BSP_SUPPORT_APP_SPI_LED == 1 )
-
-#if ( MCU_BSP_SUPPORT_APP_FW_UPDATE == 1 )
-    #include "fwupdate.h"
-#elif ( MCU_BSP_SUPPORT_APP_FW_UPDATE_ECCP == 1 )
-    #include "fwupdate.h"
-#endif
 
 static void Delay_Loop(volatile uint32 count);
 static int32 Simple_Atoi(char *str);
@@ -162,10 +129,6 @@ void Motor_HW_Init(void)
     g_LastDutyR = 0xFFFF;
     Update_PWM_Duty(MOTOR_L_PWM_CH, 0);
     Update_PWM_Duty(MOTOR_R_PWM_CH, 0);
-
-    // [FIX] PDM Enable (채널, 모니터링OFF)
-    // PDM_Enable(MOTOR_L_PWM_CH, 0);
-    // PDM_Enable(MOTOR_R_PWM_CH, 0);
 }
 
 static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale)
@@ -377,176 +340,4 @@ void cmain(void)
     }
 }
 
-
-/*
-***************************************************************************************************
-*                                          Main_StartTask
-*
-* This is an example of a startup task.
-*
-* Notes
-*   As mentioned in the book's text, you MUST initialize the ticker only once multitasking has
-*   started.
-*
-*   1) The first line of code is used to prevent a compiler warning because 'pArg' is not used.
-*      The compiler should not generate any code for this statement.
-*
-***************************************************************************************************
-*/
-static void Main_StartTask(void * pArg)
-{
-    (void)pArg;
-    (void)SAL_OsInitFuncs();
-
-    /* Service Init*/
-
-    /* Create application tasks */
-    AppTaskCreate();
-
-    while (1)
-    {  /* Task body, always written as an infinite loop.       */
-        DisplayAliveLog();
-        //mcu_printf("\n MCU Idle !!!");
-        mcu_printf("whyrano\n");
-        (void)SAL_TaskSleep(1000);
-        mcu_printf("=======@DEBUG@=======\n");
-    }
-}
-
-static void AppTaskCreate(void)
-{
-#if (APLT_LINUX_SUPPORT_SPI_DEMO == 1)
-    ECCP_InitSPIManager();
-#endif  
-#if (APLT_LINUX_SUPPORT_POWER_CTRL == 1)
-    POWER_APP_StartDemo();
-#endif
-
-  
-#if ( MCU_BSP_SUPPORT_APP_CONSOLE == 1 )
-    CreateConsoleTask();
-#endif  // ( MCU_BSP_SUPPORT_APP_CONSOLE == 1 )
-
-#if ( MCU_BSP_SUPPORT_APP_KEY == 1 )
-    KEY_AppCreate();
-#endif  // ( MCU_BSP_SUPPORT_APP_KEY == 1 )
-
-#if ( MCU_BSP_SUPPORT_CAN_DEMO == 1 )
-    CAN_DemoCreateApp();
-#endif  // ( MCU_BSP_SUPPORT_CAN_DEMO == 1 )
-
-#if ( MCU_BSP_SUPPORT_APP_FW_UPDATE == 1 )
-    CreateFWUDTask();
-#elif ( MCU_BSP_SUPPORT_APP_FW_UPDATE_ECCP == 1 )
-    CreateFWUDTask();
-#endif
-
-#if ( MCU_BSP_SUPPORT_APP_IDLE == 1 )
-    IDLE_CreateTask();
-#endif  // ( MCU_BSP_SUPPORT_APP_IDLE == 1 )
-
-#if ( MCU_BSP_SUPPORT_APP_SPI_LED == 1)
-    SPILED_CreateAppTask();
-#endif  // ( MCU_BSP_SUPPORT_APP_SPI_LED == 1 )
-
-}
-
-static void DisplayAliveLog(void)
-{
-    if (gALiveMsgOnOff != 0U)
-    {
-        mcu_printf("\n %d", gALiveCount);
-
-        gALiveCount++;
-
-        if(gALiveCount >= MAIN_UINT_MAX_NUM)
-        {
-            gALiveCount = 0;
-        }
-    }
-    else
-    {
-        gALiveCount = 0;
-    }
-}
-
-#define LDT1_AREA_ADDR  0xA1011800U
-#define PMU_REG_ADDR    0xA0F28000U
-
-static void DisplayOTPInfo(void)
-{
-    volatile uint32 *ldt1Addr;
-    volatile uint32 *chipNameAddr;
-    volatile uint32 *remapAddr;
-    volatile uint32 *hsmStatusAddr;
-    uint32          chipName = 0;
-    uint32          dualBankVal = 0;
-    uint32          dual_bank = 0;
-    uint32          expandFlashVal = 0;
-    uint32          expand_flash = 0;
-    uint32          remap_mode = 0;
-    uint32          hsm_ready = 0;
-
-    //----------------------------------------------------------------
-    // OTP LDT1 Read
-    // [11:0]Dual_Bank_Selection, [59:48]EXPAND_FLASH
-    // Dual_Bank_Sel: [0xC0][11: 0] & [0xD0][11: 0] & [0xE0][11: 0] & [0xF0][11: 0]
-    // EXPAND_FLASH : [0xC4][27:16] & [0xD4][27:16] & [0xE4][27:16] & [0xF4][27:16]
-    // HwMC_PRG_FLS_LDT1: 0xA1011800
-
-    ldt1Addr = (volatile uint32 *)(LDT1_AREA_ADDR + 0x00C0);
-    chipNameAddr = (volatile uint32 *)(LDT1_AREA_ADDR + 0x0300);
-    remapAddr = (volatile uint32 *)(PMU_REG_ADDR);
-    hsmStatusAddr = (volatile uint32 *)(PMU_REG_ADDR + 0x0020);
-
-    chipName = *chipNameAddr;
-    chipName &= 0x000FFFFF;
-
-    dualBankVal = ldt1Addr[ 0];
-    expandFlashVal = ldt1Addr[ 1];
-
-    dualBankVal &= ldt1Addr[ 4];
-    expandFlashVal &= ldt1Addr[ 5];
-
-    dualBankVal &= ldt1Addr[ 8];
-    expandFlashVal &= ldt1Addr[ 9];
-
-    dualBankVal &= ldt1Addr[12];
-    expandFlashVal &= ldt1Addr[13];
-
-    dualBankVal = (dualBankVal >> 0) & 0x0FFF;
-    expandFlashVal  = (expandFlashVal >> 16) & 0x0FFF;
-
-    dual_bank = (dualBankVal == 0x0FFF) ? 0 : 1;            // (single_bank : dual_bank)
-    expand_flash  = (expandFlashVal  == 0x0000) ? 0 : 1;    // (only_eFlash : use_extSNOR)
-
-    remap_mode = remapAddr[ 0];
-
-    mcu_printf("    CHIP   NAME  : %x\n",    chipName);
-    mcu_printf("    DUAL   BANK  : %d\n",    dual_bank);
-    mcu_printf("    EXPAND FLASH : %d\n",    expand_flash);
-    mcu_printf("    REMAP  MODE  : %d\n",    (remap_mode >> 16));
-
-    hsm_ready = hsmStatusAddr[ 0];
-    hsm_ready = (hsm_ready >> 2) & 0x0001;
-#if 0
-    if(hsm_ready)
-    {
-        mcu_printf("    HSM    READY : %d\n",    hsm_ready);
-    }
-    else
-    {
-        while(hsm_ready != 1)
-        {
-            mcu_printf("    HSM    READY : %d\n",    hsm_ready);
-            mcu_printf("    wait...\n");
-            hsm_ready = (hsm_ready >> 2) & 0x0001;
-        }
-    }
-#else
-    mcu_printf("    HSM    READY : %d\n",    hsm_ready);
-#endif
-}
-
 #endif  // ( MCU_BSP_SUPPORT_APP_BASE == 1 )
-
