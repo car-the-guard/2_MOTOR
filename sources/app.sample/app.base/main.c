@@ -24,6 +24,8 @@
 //#include "reg_phys.h"
 #include <uart.h>
 #include <gpio.h>
+#include <pdm.h>
+#include <string.h>
 //#include <cstdint>
 
 #if (APLT_LINUX_SUPPORT_SPI_DEMO == 1)
@@ -58,13 +60,38 @@
     #include "fwupdate.h"
 #endif
 
+static void Delay_Loop(volatile uint32 count);
+static int32 Simple_Atoi(char *str);
+static float Clamp_Val(float x, float lo, float hi);
+static void Motor_HW_Init(void);
+static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale);
+static void Motor_Set_VCP(uint32 channel, uint32 p1, uint32 p2, float speed);
+static void Car_Update_Logic(void);
+static void Parse_Command(char *cmd);
 
-#define BLUETOOTH_UART_CH        (0)
-#define UART_TX_PIN         GPIO_GPA(28)
-#define UART_RX_PIN         GPIO_GPA(29)
-#define HC06_BAUDRATE       (9600)
-#define UART_PORTCFG        0
-#define CMD_BUF_SIZE            (64)
+// SDK 내부 함수들도 미리 선언해야 "static conflicts" 에러가 안 납니다.
+static void AppTaskCreate(void); 
+static void DisplayAliveLog(void);
+static void DisplayOTPInfo(void); // 로그에 보여서 추가함
+
+//bluetooth set ch0_A28(18),29(19)
+#define BLUETOOTH_UART_CH       (0)             // UART Ch0 (보드 핀맵 확인!)
+#define HC06_BAUDRATE           (9600)          
+
+// left motor - PDM Ch0
+#define MOTOR_L_PWM_CH          (0)             
+#define MOTOR_L_IN1             GPIO_GPB(23)     // TODO: 실제 핀 번호로 수정 (예: GPIO_GPC(3))
+#define MOTOR_L_IN2             GPIO_GPB(21)     
+
+// right motor - PDM Ch1
+#define MOTOR_R_PWM_CH          (1)             
+#define MOTOR_R_IN1             GPIO_GPB(2)     
+#define MOTOR_R_IN2             GPIO_GPB(3)     
+
+// parameter set
+#define PWM_PERIOD_NS           (1000000UL)     
+#define MAX_DUTY_SCALE          (1000UL) // 사용자 제어 해상도 (0~1000)
+#define TURN_SENSITIVITY        (1.0f)          // 회전 민감도
 
 /*
 ***************************************************************************************************
@@ -74,14 +101,17 @@
 uint32                                  gALiveMsgOnOff;
 static uint32                           gALiveCount;
 
-volatile int32 g_TargetSpeed = 0;   // -100 ~ 100
-volatile int32 g_TargetAngle = 0;   // -100 ~ 100
+volatile int32 g_TargetF = 0;   // Forward : -100 ~ 100
+volatile int32 g_TargetR = 0;   // Rotation: -100 ~ 100
 
 /*
 ***************************************************************************************************
 *                                         FUNCTION PROTOTYPES
 ***************************************************************************************************
 */
+
+//3 Utility Function
+void Delay_Loop(volatile uint32 count) { while (count--) { __asm("nop"); }}
 
 int32 Simple_Atoi(char *str)
 {
@@ -95,6 +125,114 @@ int32 Simple_Atoi(char *str)
     return res;
 }
 
+static float Clamp_Val(float x, float lo, float hi)
+{
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// 4 Motor Init, Control Function
+    // 4-1 Motor Init
+void Motor_HW_Init(void)
+{
+    // GPIO 설정
+    GPIO_Config(MOTOR_L_IN1, GPIO_FUNC(0) | GPIO_OUTPUT);
+    GPIO_Config(MOTOR_L_IN2, GPIO_FUNC(0) | GPIO_OUTPUT);
+    GPIO_Config(MOTOR_R_IN1, GPIO_FUNC(0) | GPIO_OUTPUT);
+    GPIO_Config(MOTOR_R_IN2, GPIO_FUNC(0) | GPIO_OUTPUT);
+
+    // [FIX] PDM 초기화 (인자 없음)
+    PDM_Init(); 
+
+    // 초기 상태: 0속도 설정 및 Enable
+    Update_PWM_Duty(MOTOR_L_PWM_CH, 0);
+    Update_PWM_Duty(MOTOR_R_PWM_CH, 0);
+
+    // [FIX] PDM Enable (채널, 모니터링OFF)
+    PDM_Enable(MOTOR_L_PWM_CH, 0);
+    PDM_Enable(MOTOR_R_PWM_CH, 0);
+}
+
+static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale)
+{
+    PDMModeConfig_t pdmConfig;
+    
+    // 구조체 0으로 초기화 (안전)
+    memset(&pdmConfig, 0, sizeof(PDMModeConfig_t));
+
+    // 1. 기본 설정
+    pdmConfig.mcOperationMode   = PDM_OUTPUT_MODE_PHASE_1; // Phase Mode 1 (기본 PWM)
+    pdmConfig.mcOutputCtrl      = 1; // Output Enable (추정치, 보통 1)
+    pdmConfig.mcClockDivide     = 0; // Divider 0
+
+    // 2. 주기 및 듀티 설정 (나노초 단위)
+    pdmConfig.mcPeriodNanoSec1  = PWM_PERIOD_NS; // 1,000,000ns (1kHz)
+    
+    // Duty 계산: (입력값 / 1000) * 주기
+    // 예: 입력 500 -> 500,000ns (50%)
+    if(duty_1000_scale > MAX_DUTY_SCALE) duty_1000_scale = MAX_DUTY_SCALE;
+    pdmConfig.mcDutyNanoSec1    = duty_1000_scale * (PWM_PERIOD_NS / MAX_DUTY_SCALE);
+
+    // 3. 설정 적용
+    PDM_SetConfig(channel, &pdmConfig);
+}
+    // 4-2 Motor Control Function
+void Motor_Set_VCP(uint32 channel, uint32 p1, uint32 p2, float speed)
+{
+    uint32 duty = 0;
+    float abs_speed = 0.0f;
+
+    // Control
+    if (speed > 0)          // 전진
+    {
+        GPIO_Set(p1, 1);
+        GPIO_Set(p2, 0);
+        abs_speed = speed;
+    }
+    else if (speed < 0)     // 후진
+    {
+        GPIO_Set(p1, 0);
+        GPIO_Set(p2, 1);
+        abs_speed = -speed; // 절대값으로 변환
+    }
+    else                    // 정지
+    {
+        GPIO_Set(p1, 0);
+        GPIO_Set(p2, 0);
+        abs_speed = 0;
+    }
+
+    // ARR scailing (0~1000)
+    duty = (uint32)(abs_speed * 10.0f);
+
+    // Safty
+    //if (duty > MAX_DUTY) duty = MAX_DUTY;
+
+    // Set PWM
+    Update_PWM_Duty(channel, duty);
+}
+
+// 5 Skid Steering
+void Car_Update_Logic(void)
+{
+    float F = (float)g_TargetF;
+    float R = (float)g_TargetR;
+
+    // Mixing
+    float left_val  = F + (R * TURN_SENSITIVITY);
+    float right_val = F - (R * TURN_SENSITIVITY);
+
+    // Clamping (-100 ~ 100)
+    left_val  = Clamp_Val(left_val,  -100.0f, 100.0f);
+    right_val = Clamp_Val(right_val, -100.0f, 100.0f);
+
+    // Motor Update
+    Motor_Set_VCP(MOTOR_L_PWM_CH, MOTOR_L_IN1, MOTOR_L_IN2, left_val);
+    Motor_Set_VCP(MOTOR_R_PWM_CH, MOTOR_R_IN1, MOTOR_R_IN2, right_val);
+}
+
+// 6 Command Parsing
 void Parse_Command(char *cmd)
 {
     int32 i = 0;
@@ -104,51 +242,23 @@ void Parse_Command(char *cmd)
     {
         if (cmd[i] == 'F') { // 전진
             val = Simple_Atoi(&cmd[i + 1]);
-            g_TargetSpeed = val;            
+            g_TargetF = val;            
         }
         else if (cmd[i] == 'B') { // 후진
             val = Simple_Atoi(&cmd[i + 1]);
-            g_TargetSpeed = -val;           
+            g_TargetF = -val;           
         }
         else if (cmd[i] == 'R') { // 우회전
             val = Simple_Atoi(&cmd[i + 1]);
-            g_TargetAngle = val;            
+            g_TargetR = val;            
         }
         else if (cmd[i] == 'L') { // 좌회전
             val = Simple_Atoi(&cmd[i + 1]);
-            g_TargetAngle = -val;           
+            g_TargetR = -val;           
         }
         i++;
     }
 }
-
-void Delay_Loop(volatile uint32 count)
-{
-    while (count--) { __asm("nop"); }
-}
-
-static void Main_StartTask
-(
-    void *                              pArg
-);
-
-static void AppTaskCreate
-(
-    void
-);
-
-static void DisplayAliveLog
-(
-    void
-);
-
-static void DisplayOTPInfo
-(
-    void
-);
-
-
-
 
 
 /*
@@ -168,83 +278,59 @@ static void DisplayOTPInfo
 *
 ***************************************************************************************************
 */
+
 void cmain(void)
 {
     UartParam_t uartParam;
-    
-    // 수신 버퍼
     static uint8 rx_char;
-    static char cmd_buf[CMD_BUF_SIZE];
+    static char cmd_buf[64];
     static uint8 cmd_len = 0;
 
-    // 1. 초기화
     (void)SAL_Init();
     BSP_PreInit();
     BSP_Init(); 
 
-    // 2. UART 설정
-    UART_Close(BLUETOOTH_UART_CH);
+    // 모터 초기화
+    Motor_HW_Init();
 
+    // UART 초기화
+    UART_Close(BLUETOOTH_UART_CH);
     uartParam.sCh           = BLUETOOTH_UART_CH;
-    uartParam.sPriority     = 10U;
     uartParam.sBaudrate     = HC06_BAUDRATE;
     uartParam.sMode         = UART_POLLING_MODE;
-    uartParam.sCtsRts       = UART_CTSRTS_OFF;
-    uartParam.sPortCfg      = 0;
+    uartParam.sPortCfg      = 0; 
     uartParam.sWordLength   = WORD_LEN_8;
     uartParam.sFIFO         = ENABLE_FIFO;
     uartParam.s2StopBit     = TWO_STOP_BIT_OFF;
-    uartParam.sParity       = 0; // No Parity
+    uartParam.sParity       = 0;
     uartParam.sFnCallback   = NULL;
+    UART_Open(&uartParam);
 
-    if (UART_Open(&uartParam) != 0) 
-    {
-        while(1) { Delay_Loop(100000); }
-    }
+    mcu_printf("\n[VCP] RC Car Ready! (Scale: 0~1000)\n");
 
-    mcu_printf("\n[VCP] Ready!\n");
-
-    // 3. 무한 루프
     while (1)
     {
-        // (A) 한 글자 수신 시도
         if (UART_Read(BLUETOOTH_UART_CH, &rx_char, 1) > 0)
         {
-            // (B) 줄바꿈 문자 확인 (명령어 끝)
             if (rx_char == '\n' || rx_char == '\r')
             {
                 if (cmd_len > 0) 
                 {
-                    cmd_buf[cmd_len] = '\0'; // 문자열 마무리 (Null Termination)
-                    
-                    // [★추가됨] 완성된 문자열 전체 출력
-                    // 스마트폰 앱 화면에 "[CMD] F100R50" 처럼 뜰 것입니다.
-                    mcu_printf("[CMD] %s\n", cmd_buf); 
-                    
-                    // (C) 해석 및 적용
+                    cmd_buf[cmd_len] = '\0';
+                    mcu_printf("\n[BT RX] %s\n", cmd_buf);
                     Parse_Command(cmd_buf);
-                    mcu_printf(" -> S:%d, A:%d\n", g_TargetSpeed, g_TargetAngle);
-
-                    // 버퍼 초기화 (다음 명령을 위해)
                     cmd_len = 0;
                 }
             }
-            // (D) 일반 문자일 경우 버퍼에 담기
             else
             {
-                if (cmd_len < CMD_BUF_SIZE - 1) 
-                {
-                    cmd_buf[cmd_len++] = (char)rx_char;
-                }
-                else 
-                {
-                    cmd_len = 0; // 버퍼 꽉 차면 비움 (안전장치)
-                }
+                if (cmd_len < 63) cmd_buf[cmd_len++] = (char)rx_char;
+                else cmd_len = 0; 
             }
         }
 
-        // 루프 지연
-        Delay_Loop(1000);
+        Car_Update_Logic();
+        Delay_Loop(1000); 
     }
 }
 
