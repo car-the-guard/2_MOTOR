@@ -27,7 +27,12 @@
 #include <string.h>
 #include <stdint.h> 
 
+// #include <can.h>
+// #include <can_drv.h>
+
 // CAN Drivers
+#include "can_config.h"  
+#include "can_reg.h"    
 #include "can.h"
 #include "can_drv.h"
 
