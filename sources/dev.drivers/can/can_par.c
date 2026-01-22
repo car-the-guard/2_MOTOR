@@ -12,8 +12,9 @@
 *
 ***************************************************************************************************
 */
-
+#define MCU_BSP_SUPPORT_DRIVER_CAN  1
 #if ( MCU_BSP_SUPPORT_DRIVER_CAN == 1 )
+
 
 /**************************************************************************************************
 *                                           INCLUDE FILES
@@ -161,7 +162,7 @@ CANRxBuffer_t RxBufferFIFO1InfoPar[ CAN_CONTROLLER_NUMBER ] =
 static CANIdFilterList_t StandardIDFilterPar_CH0[ CAN_STANDARD_ID_FILTER_NUMBER ] =
 {
    /* FilterType,            FilterElementConfiguration,     FilterID1,  FilterID2 */
-    { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO0,         0x000,      0x100 },
+    { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO0,         0x000,      0x7FF },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO1,         0x101,      0x200 },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_PRY_N_RXFIFO0,   0x201,      0x300 },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_PRY_N_RXFIFO1,   0x301,      0x400 },
@@ -173,7 +174,7 @@ static CANIdFilterList_t StandardIDFilterPar_CH0[ CAN_STANDARD_ID_FILTER_NUMBER 
 static CANIdFilterList_t StandardIDFilterPar_CH1[ CAN_STANDARD_ID_FILTER_NUMBER ] =
 {
    /* FilterType,            FilterElementConfiguration,     FilterID1,  FilterID2 */
-    { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO0,         0x000,      0x100 },
+    { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO0,         0x000,      0x7FF },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO1,         0x101,      0x200 },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_PRY_N_RXFIFO0,   0x201,      0x300 },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_PRY_N_RXFIFO1,   0x301,      0x400 },
@@ -185,7 +186,7 @@ static CANIdFilterList_t StandardIDFilterPar_CH1[ CAN_STANDARD_ID_FILTER_NUMBER 
 static CANIdFilterList_t StandardIDFilterPar_CH2[ CAN_STANDARD_ID_FILTER_NUMBER ] =
 {
    /* FilterType,            FilterElementConfiguration,     FilterID1,  FilterID2 */
-    { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO0,         0x000,      0x100 },
+    { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO0,         0x000,      0x7FF },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_RXFIFO1,         0x101,      0x200 },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_PRY_N_RXFIFO0,   0x201,      0x300 },
     { CAN_FILTER_TYPE_RANGE, CAN_FILTER_CFG_PRY_N_RXFIFO1,   0x301,      0x400 },
