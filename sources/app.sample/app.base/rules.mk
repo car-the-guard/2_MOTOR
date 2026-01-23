@@ -25,4 +25,5 @@ INCLUDES += -I$(MCU_BSP_APP_SAMPLE_BASE_PATH)/$(MCU_BSP_CHIPSET_FAMILY_NAME)
 
 # Sources
 SRCS += main.c
-
+SRCS += can_app.c
+SRCS += timestamp.c
