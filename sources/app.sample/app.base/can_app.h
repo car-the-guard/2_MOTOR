@@ -1,6 +1,7 @@
 #ifndef CAN_APP_H
 #define CAN_APP_H
 
+#include "can_config.h"
 #include "can.h"
 #include <stdint.h>
 
