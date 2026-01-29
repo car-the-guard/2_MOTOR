@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 /*
 ***************************************************************************************************
-* FileName : main.c (Motor Board - FW Logic Integrated)
+* FileName : main.c (Motor Board - RTOS Based V2.0)
+* Description : VCP SDK & SAL RTOS 기반 모터 제어 및 엔코더 피드백
 ***************************************************************************************************
 */
 
@@ -14,7 +15,7 @@
 #include <bsp.h>
 #include <gpio.h>
 #include <pdm.h>
-#include <ictc.h> // ICTC 헤더 필수
+#include <ictc.h>
 #include <string.h>
 
 // [CAN & ICTC Drivers]
@@ -27,12 +28,49 @@
 // [0] 매크로 및 상수 정의
 // =========================================================
 // CAN Config
-#define CAN_ID_DRIVE_CMD        (0x106)  
-#define CAN_ID_SPEED_FEEDBACK   (0x13)  
+#define CAN_ID_DRIVE_CMD        (0x106)  // 2차 프로젝트용 Command ID
+#define CAN_ID_SPEED_FEEDBACK   (0x13)   // 2차 프로젝트용 Feedback ID
 #define CAN_RX_QUEUE_SIZE       (64)
 #define CAN_CH_CMD              (0)
 
-// ICTC & Encoder Macros (제공해주신 코드 반영)
+// Safety Config
+#define CMD_TIMEOUT_MS          (500)    // 통신 두절 판단 시간
+
+// Parameters
+#define COUNTS_PER_REV          (1600.0f) 
+#define WHEEL_DIA_M             (0.065f)  
+#define PI                      (3.141592f)
+#define ENCODER_L_ICTC_CH       (0)         
+#define ENCODER_PIN_INDEX       (64UL)      
+#define ENCODER_GPIO_PIN        GPIO_GPC(4)
+
+// Motor Pins (Hardware Dependent)
+#define MOTOR_L_PWM_CH          (0)
+#define MOTOR_L_IN1             GPIO_GPB(23)
+#define MOTOR_L_IN2             GPIO_GPB(21)
+
+#define MOTOR_R_PWM_CH          (1) 
+#define MOTOR_R_IN1             GPIO_GPB(24)
+#define MOTOR_R_IN2             GPIO_GPB(22)
+
+#define PWM_PERIOD_NS           (1000000UL)     
+#define MAX_DUTY_SCALE          (1000UL) 
+#define TURN_SENSITIVITY        (1.0f)          
+#define USE_PMM_MONITOR         (0UL)
+#ifndef GPIO_PERICH_CH0
+#define GPIO_PERICH_CH0         (0UL)
+#endif
+
+// Rate Limiter
+#define STEP_VAL                (2.0f) // Slew Rate 제한
+
+// Task Config
+#define TASK_CAN_PRIO           (SAL_PRIO_APP_CFG + 5) // 통신은 우선순위 높게
+#define TASK_MOTOR_PRIO         (SAL_PRIO_APP_CFG + 2) // 제어는 주기성 보장
+#define TASK_STK_SIZE           (1024)
+#define CTRL_PERIOD_MS          (10) // 제어 주기 10ms
+
+// ICTC Macros (기존 유지)
 #ifndef ICTC_IRQ_CTRL_PRDDT_CMP_ISR
 #define ICTC_IRQ_CTRL_PRDDT_CMP_ISR      (1UL << 4) 
 #endif
@@ -50,47 +88,14 @@
 #define ICTC_OPMODE_CTRL_F_IN_SEL_OFFSET (8)
 #endif
 
-// Parameters
-#define COUNTS_PER_REV          (1600.0f) 
-#define WHEEL_DIA_M             (0.065f)  
-#define PI                      (3.141592f)
-#define ENCODER_L_ICTC_CH       (0)         
-#define ENCODER_PIN_INDEX       (64UL)      
-#define ENCODER_GPIO_PIN        GPIO_GPC(4)
-
-// Motor Pins
-#define MOTOR_L_PWM_CH          (0)
-#define MOTOR_L_IN1             GPIO_GPB(23)
-#define MOTOR_L_IN2             GPIO_GPB(21)
-#define MOTOR_R_PWM_CH          (1) // 제공 코드는 Ch8이나 RTOS환경에선 보통 1 사용 (확인필요)
-#define MOTOR_R_IN1             GPIO_GPB(24)
-#define MOTOR_R_IN2             GPIO_GPB(22)
-
-#define PWM_PERIOD_NS           (1000000UL)     
-#define MAX_DUTY_SCALE          (1000UL) 
-#define TURN_SENSITIVITY        (1.0f)          
-#define USE_PMM_MONITOR         (0UL)
-#ifndef GPIO_PERICH_CH0
-#define GPIO_PERICH_CH0         (0UL)
-#endif
-
-// Rate Limiter
-#define STEP_VAL                (2.0f)
-
-// Task Config
-#define TASK_CAN_PRIO           (SAL_PRIO_APP_CFG + 5)
-#define TASK_MOTOR_PRIO         (SAL_PRIO_APP_CFG + 2)
-#define TASK_STK_SIZE           (1024)
-
 // =========================================================
 // [1] 구조체 정의
 // =========================================================
 typedef struct {
     int32 counter;      
     int32 last_counter;  
-    // int64 total_count; (SDK 타입 지원 여부에 따라 제외 가능)
-    float speed_rpm;       
-    float speed_mps;       
+    float speed_rpm;        
+    float speed_mps;        
 } Encoder_t;
 
 typedef struct
@@ -103,13 +108,13 @@ typedef struct
 // =========================================================
 // [2] 전역 변수
 // =========================================================
-uint32 gALiveMsgOnOff = 1; 
 static uint32 g_canRxQueueHandle = 0;
+Encoder_t Enc1; 
 
-Encoder_t Enc1; // 엔코더 인스턴스
-
+// Control Variables
 volatile int32 g_TargetF = 0;   
 volatile int32 g_TargetR = 0;   
+volatile uint32 g_LastCmdTick = 0; // [Safety] 마지막 명령 수신 시각
 
 static uint32 g_LastDutyL = 0xFFFF;
 static uint32 g_LastDutyR = 0xFFFF;
@@ -155,10 +160,10 @@ void cmain (void)
     BSP_PreInit();
     BSP_Init();
 
-    mcu_printf("\n[MOTOR BOARD] START (FW Logic Ported)\n");
+    mcu_printf("\n[MOTOR BOARD] RTOS Project V2.0 START\n");
 
     (void)SAL_TaskCreate(&AppTaskStartID, (const uint8 *)"StartTask", (SALTaskFunc)&Main_StartTask,
-                                     &AppTaskStartStk[0], ACFG_TASK_MEDIUM_STK_SIZE, SAL_PRIO_APP_CFG, NULL);
+                         &AppTaskStartStk[0], ACFG_TASK_MEDIUM_STK_SIZE, SAL_PRIO_APP_CFG, NULL);
     (void)SAL_OsStart();
 }
 
@@ -166,7 +171,10 @@ static void Main_StartTask(void * pArg)
 {
     (void)pArg;
     (void)SAL_OsInitFuncs();
+    
+    (void)SAL_GetTickCount((uint32 *)&g_LastCmdTick); // 초기화
     AppTaskCreate();
+    
     while (1) { (void)SAL_TaskSleep(5000); }
 }
 
@@ -175,22 +183,23 @@ static void AppTaskCreate(void)
     static uint32 TaskCanID, TaskCanStk[TASK_STK_SIZE];
     static uint32 TaskMotorID, TaskMotorStk[TASK_STK_SIZE];
 
-    // 하드웨어 초기화
     Motor_HW_Init();
-    Encoder_HW_Init(); // [중요] 엔코더(ICTC) 설정
+    Encoder_HW_Init(); 
 
     SAL_QueueCreate(&g_canRxQueueHandle, (const uint8 *)"CAN_Q", CAN_RX_QUEUE_SIZE, sizeof(CAN_RxPacket_t));
     Init_CAN_HW();
 
+    // CAN 수신 태스크 (Event Driven)
     SAL_TaskCreate(&TaskCanID, (const uint8 *)"CAN Task", (SALTaskFunc)&Task_CAN_Rx, 
                    &TaskCanStk[0], TASK_STK_SIZE, TASK_CAN_PRIO, NULL);
 
+    // 모터 제어 태스크 (Time Triggered)
     SAL_TaskCreate(&TaskMotorID, (const uint8 *)"Motor Task", (SALTaskFunc)&Task_MotorControl, 
                    &TaskMotorStk[0], TASK_STK_SIZE, TASK_MOTOR_PRIO, NULL);
 }
 
 // ---------------------------------------------------------
-// Task 1: CAN 수신
+// Task 1: CAN 수신 (Queue Pending)
 // ---------------------------------------------------------
 static void Task_CAN_Rx(void *pArg)
 {
@@ -198,50 +207,69 @@ static void Task_CAN_Rx(void *pArg)
     CAN_RxPacket_t rxPacket;
     uint32 uiSizeCopied;
 
-    mcu_printf("[Task] CAN Rx Ready\n");
+    mcu_printf("[Task] CAN Rx Running\n");
 
     while(1)
     {
+        // 큐에서 메시지를 기다림 (Blocking)
         if (SAL_QueueGet(g_canRxQueueHandle, &rxPacket, &uiSizeCopied, 0, SAL_OPT_BLOCKING) == SAL_RET_SUCCESS)
         {
             if (rxPacket.id == CAN_ID_DRIVE_CMD) 
             {
-                g_TargetF = (char)rxPacket.data[0];
-                g_TargetR = (char)rxPacket.data[3] - (char)rxPacket.data[2];
-                mcu_printf("[CMD] F:%d\n", g_TargetF);
+                // [Logic] 글로벌 변수 업데이트 (Critical Section 처리가 이상적이나, 단일 쓰기라 허용)
+                g_TargetF = (int8)rxPacket.data[0];
+                g_TargetR = (int8)rxPacket.data[3] - (int8)rxPacket.data[2];
+                
+                // [Safety] 워치독 타이머 갱신
+                (void)SAL_GetTickCount((uint32 *)&g_LastCmdTick);
             }
         }
     }
 }
 
 // ---------------------------------------------------------
-// Task 2: 모터 제어 및 엔코더 업데이트 (20ms 주기)
+// Task 2: 모터 제어 (Periodic: 10ms)
 // ---------------------------------------------------------
 static void Task_MotorControl(void *pArg)
 {
     (void)pArg;
-    mcu_printf("[Task] Motor Control Ready\n");
+    uint32 currentTick;
+    uint32 can_tx_tick = 0;
+
+    mcu_printf("[Task] Motor Control Running (10ms)\n");
 
     while(1)
     {
-        // 1. 모터 구동
+        (void)SAL_GetTickCount(&currentTick);
+
+        // [Safety] Failsafe: 통신 두절 체크
+        if ((currentTick - g_LastCmdTick) > CMD_TIMEOUT_MS)
+        {
+            g_TargetF = 0;
+            g_TargetR = 0;
+            // 필요 시 로그 출력 (너무 자주 찍히지 않도록 주의)
+        }
+
+        // 1. 모터 구동 로직 수행 (Rate Limit & Mixing)
         Car_Update_Logic();
 
-        // 2. 엔코더 업데이트 (주기: 20ms)
-        // FW 코드 로직 그대로 사용
-        Encoder_Update(&Enc1, 20.0f); 
+        // 2. 엔코더 업데이트 (dt = 10ms)
+        Encoder_Update(&Enc1, (float)CTRL_PERIOD_MS); 
 
-        // 3. CAN 피드백 전송 (m/s -> cm/s 변환)
-        // 왼쪽만 엔코더가 있다면 오른쪽은 0 또는 동일 값 전송
-        CAN_Send_Feedback((int16)(Enc1.speed_mps * 100.0f), 0);
+        // 3. CAN 피드백 전송 (250ms 주기)
+        if ((currentTick - can_tx_tick) >= 250)
+        {
+            CAN_Send_Feedback((int16)(Enc1.speed_mps * 100.0f), 0);
+            can_tx_tick = currentTick;
+        }
 
-        // 4. 주기 설정 (20ms)
-        SAL_TaskSleep(20); 
+        // 4. 주기적 실행 (Sleep)
+        SAL_TaskSleep(CTRL_PERIOD_MS); 
     }
 }
 
 // =========================================================
-// [5] 엔코더 로직 (FW 코드 이식)
+// [5] 로직 함수 구현
 // =========================================================
 static void Encoder_Update(Encoder_t *enc, float dt_ms)
 {
@@ -252,28 +280,40 @@ static void Encoder_Update(Encoder_t *enc, float dt_ms)
 
     enc->last_counter = cur_counter;
     
-    // RPM 및 속도 계산 (제공된 수식)
+    // RPM = (펄스차이 / 1회전펄스) * (60초 / dt)
     enc->speed_rpm = ((float)diff / COUNTS_PER_REV) * (60000.0f / dt_ms);
     enc->speed_mps = (enc->speed_rpm * PI * WHEEL_DIA_M) / 60.0f;
-    
-    // [디버그용 로그 - 필요시 주석 해제]
-    mcu_printf("Cnt:%d Spd:%d\n", cur_counter, (int)(enc->speed_mps*100));
 }
 
-// ICTC 인터럽트 콜백 (펄스 카운팅)
+// ICTC ISR Callback
 static void ICTC_Callback(uint32 uiChannel, uint32 uiPeriod, uint32 uiDuty)
 {
     (void)uiPeriod; (void)uiDuty;
     
     if (uiChannel == ENCODER_L_ICTC_CH) {
-        // FW 코드 로직: 목표 속도 부호에 따라 증감 결정
+        // 하드웨어 방향 감지가 안되므로 목표 방향으로 추정
         if (g_TargetF >= 0) Enc1.counter++;
         else Enc1.counter--;
     }
 }
 
+static void Car_Update_Logic(void)
+{
+    // Rate Limiting (급가속 방지)
+    curF = rate_limit(curF, (float)g_TargetF, STEP_VAL);
+    curR = rate_limit(curR, (float)g_TargetR, STEP_VAL);
+
+    // Mixing (Differential Drive)
+    float left_val  = Clamp_Val(curF + (curR * TURN_SENSITIVITY), -100.0f, 100.0f);
+    float right_val = Clamp_Val(curF - (curR * TURN_SENSITIVITY), -100.0f, 100.0f);
+
+    // Hardware Output
+    Motor_Set_VCP(MOTOR_L_PWM_CH, MOTOR_L_IN1, MOTOR_L_IN2, left_val);
+    Motor_Set_VCP(MOTOR_R_PWM_CH, MOTOR_R_IN1, MOTOR_R_IN2, right_val);
+}
+
 // =========================================================
-// [6] 하드웨어 초기화
+// [6] 하드웨어 드라이버 (VCP SDK Dependent)
 // =========================================================
 static void Encoder_HW_Init(void)
 {
@@ -282,13 +322,11 @@ static void Encoder_HW_Init(void)
 
     Enc1.counter = 0; Enc1.last_counter = 0; 
 
-    // GPC4 설정 (Pull-up)
     #ifndef GPIO_PULLUP
         #define GPIO_PULLUP 0 
     #endif
     GPIO_Config(ENCODER_GPIO_PIN, (GPIO_FUNC(0UL) | GPIO_INPUT | GPIO_INPUTBUF_EN | GPIO_DS(0x3UL) | GPIO_PULLUP));
 
-    // FW 코드 설정값 그대로 적용
     IctcConfig.mcTimeout        = 0x0FFFFFFFUL;
     IctcConfig.mcEnableIrq      = ICTC_IRQ_CTRL_PRDDT_CMP_ISR; 
     IctcConfig.mcEnableCounter  = ICTC_OPEN_CTRL_FLTCNT_EN | ICTC_OPEN_CTRL_PDCMPCNT_EN;
@@ -298,8 +336,6 @@ static void Encoder_HW_Init(void)
                                   (ENCODER_PIN_INDEX << ICTC_OPMODE_CTRL_F_IN_SEL_OFFSET);
 
     ICTC_Init();
-    
-    // 콜백 등록
     ICTC_SetCallBackFunc(ENCODER_L_ICTC_CH, (ICTCCallback)&ICTC_Callback);
     
     ICTC_SetIRQCtrlReg(ENCODER_L_ICTC_CH, IctcConfig.mcEnableIrq);
@@ -322,40 +358,6 @@ void Motor_HW_Init(void)
     PDM_Init(); 
     Update_PWM_Duty(MOTOR_L_PWM_CH, 0);
     Update_PWM_Duty(MOTOR_R_PWM_CH, 0);
-}
-
-// =========================================================
-// [7] 유틸리티 및 로직
-// =========================================================
-static void CAN_Send_Feedback(int16 speedL, int16 speedR)
-{
-    CANMessage_t txMsg;
-    uint8 ucTxBufferIndex;
-    
-    memset(&txMsg, 0, sizeof(CANMessage_t));
-    txMsg.mId = CAN_ID_SPEED_FEEDBACK; 
-    txMsg.mDataLength = 8;
-    txMsg.mBufferType = CAN_TX_BUFFER_TYPE_FIFO;
-    // txMsg.mIdType = CAN_ID_TYPE_STANDARD; // SDK에 따라 필요시 주석 해제
-
-    txMsg.mData[0] = (uint8)(speedL & 0xFF);
-    txMsg.mData[1] = (uint8)((speedL >> 8) & 0xFF);
-    txMsg.mData[2] = (uint8)(speedR & 0xFF);
-    txMsg.mData[3] = (uint8)((speedR >> 8) & 0xFF);
-
-    (void)CAN_SendMessage(CAN_CH_CMD, &txMsg, &ucTxBufferIndex);
-}
-
-static void Car_Update_Logic(void)
-{
-    curF = rate_limit(curF, (float)g_TargetF, STEP_VAL);
-    curR = rate_limit(curR, (float)g_TargetR, STEP_VAL);
-
-    float left_val  = Clamp_Val(curF + (curR * TURN_SENSITIVITY), -100.0f, 100.0f);
-    float right_val = Clamp_Val(curF - (curR * TURN_SENSITIVITY), -100.0f, 100.0f);
-
-    Motor_Set_VCP(MOTOR_L_PWM_CH, MOTOR_L_IN1, MOTOR_L_IN2, left_val);
-    Motor_Set_VCP(MOTOR_R_PWM_CH, MOTOR_R_IN1, MOTOR_R_IN2, right_val);
 }
 
 static void Update_PWM_Duty(uint32 channel, uint32 duty_1000_scale)
@@ -394,9 +396,29 @@ static void Motor_Set_VCP(uint32 channel, uint32 p1, uint32 p2, float speed)
     Update_PWM_Duty(channel, (uint32)(abs_speed * 10.0f));
 }
 
+static void CAN_Send_Feedback(int16 speedL, int16 speedR)
+{
+    CANMessage_t txMsg;
+    uint8 ucTxBufferIndex;
+    
+    memset(&txMsg, 0, sizeof(CANMessage_t));
+    txMsg.mId = CAN_ID_SPEED_FEEDBACK; 
+    txMsg.mDataLength = 8;
+    txMsg.mBufferType = CAN_TX_BUFFER_TYPE_FIFO;
+
+    txMsg.mData[0] = (uint8)(speedL & 0xFF);
+    txMsg.mData[1] = (uint8)((speedL >> 8) & 0xFF);
+    txMsg.mData[2] = (uint8)(speedR & 0xFF);
+    txMsg.mData[3] = (uint8)((speedR >> 8) & 0xFF);
+
+    (void)CAN_SendMessage(CAN_CH_CMD, &txMsg, &ucTxBufferIndex);
+}
+
 // Utils
 static float Clamp_Val(float x, float lo, float hi) {
-    if (x < lo) return lo; if (x > hi) return hi; return x;
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
 }
 static float rate_limit(float cur, float target, float step) {
     if (target > cur + step) return cur + step;
@@ -404,7 +426,7 @@ static float rate_limit(float cur, float target, float step) {
     return target;
 }
 
-// CAN Callbacks
+// CAN Callbacks (Interrupt Context)
 static void CAN_AppCallbackRxEvent(uint8 ucCh, uint32 uiRxIndex, CANMessageBufferType_t uiRxBufferType, CANErrorType_t uiError)
 {
     CANMessage_t sRxMsg; CAN_RxPacket_t qPacket;
@@ -413,6 +435,7 @@ static void CAN_AppCallbackRxEvent(uint8 ucCh, uint32 uiRxIndex, CANMessageBuffe
         if (CAN_GetNewRxMessage(ucCh, &sRxMsg) == CAN_ERROR_NONE) {
             qPacket.id = sRxMsg.mId; qPacket.dlc = sRxMsg.mDataLength;
             memcpy(qPacket.data, sRxMsg.mData, 8);
+            // ISR에서 큐로 전송 (Non-Blocking 필수)
             (void)SAL_QueuePut(g_canRxQueueHandle, &qPacket, sizeof(CAN_RxPacket_t), 0, SAL_OPT_NON_BLOCKING);
         }
     }
